@@ -1,0 +1,570 @@
+# app.R ---------------------------------------------------------------
+# Shiny app: NFL team predictability with adjustable conditions (categorical filters)
+
+# ---- Packages ----
+library(shiny)
+library(shinythemes)
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(nflreadr)
+library(DT)
+library(ggplot2)
+library(broom)
+
+# ---- GLOBAL DATA PREP (runs once) -----------------------------------
+nflgames_raw <- nflreadr::load_schedules(1999:2025)
+
+nfl_prepped <- nflgames_raw %>%
+  filter(
+    season >= 1999, season <= 2024,
+    !is.na(home_score),
+    !is.na(away_score)
+  ) %>%
+  mutate(
+    margin = home_score - away_score,
+    grass  = if_else(grepl("grass", surface, ignore.case = TRUE), 1, 0),
+    indoor = if_else(roof %in% c("dome", "closed"), 1, 0),
+    
+    hour = suppressWarnings(as.numeric(substr(gametime, 1, 2))),
+    hour_clean = if_else(is.na(hour), -1, hour),
+    
+    noon      = if_else(hour_clean >= 11 & hour_clean < 14, 1, 0),
+    afternoon = if_else(hour_clean >= 14 & hour_clean < 19, 1, 0),
+    
+    weekday = tolower(weekday),
+    weekend = if_else(weekday %in% c("saturday", "sunday"), 1, 0),
+    
+    home_team = factor(home_team),
+    away_team = factor(away_team)
+  ) %>%
+  drop_na(
+    margin, temp, wind, spread_line,
+    home_rest, away_rest,
+    grass, indoor, noon, afternoon, weekend
+  ) %>%
+  mutate(
+    home_team = dplyr::recode(
+      home_team,
+      "STL" = "LA",
+      "SD"  = "LAC",
+      "OAK" = "LV"
+    ),
+    away_team = dplyr::recode(
+      away_team,
+      "STL" = "LA",
+      "SD"  = "LAC",
+      "OAK" = "LV"
+    )
+  )
+
+# All team names for selector
+all_teams <- sort(unique(c(as.character(nfl_prepped$home_team),
+                           as.character(nfl_prepped$away_team))))
+
+# ---- UI ----
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  titlePanel("NFL Team Predictability (1999–2024)"),
+  
+  # Short intro at top
+  fluidRow(
+    column(
+      width = 12,
+      tags$p(
+        strong("How to use this app: "),
+        "Select game environment filters on the left. The model refits automatically. Rolling predictability results for the selected teams can be seen in the Team Predictability tab."
+      )
+    )
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Game selection"),
+      
+      sliderInput(
+        "season_range",
+        "Season range:",
+        min   = 1999,
+        max   = 2024,
+        value = c(1999, 2024),
+        step  = 1,
+        sep   = ""
+      ),
+      
+      # --- CATEGORICAL ENVIRONMENT FILTERS ---------------------------
+      h4("Environment filters"),
+      
+      selectInput(
+        "temp_cat",
+        "Temperature category:",
+        choices = c(
+          "All temperatures"  = "all",
+          "Cold (< 40°F)"     = "cold",
+          "Cool (40–59°F)"    = "cool",
+          "Warm (60–75°F)"    = "warm",
+          "Hot (> 75°F)"      = "hot"
+        ),
+        selected = "all"
+      ),
+      tags$small("Example: Warm = 60–75°F."),
+      
+      selectInput(
+        "wind_cat",
+        "Wind category:",
+        choices = c(
+          "All wind speeds"  = "all",
+          "Calm (0–5 mph)"   = "calm",
+          "Breezy (6–15 mph)"= "breezy",
+          "Windy (16+ mph)"  = "windy"
+        ),
+        selected = "all"
+      ),
+      
+      selectInput(
+        "home_rest_cat",
+        "Home rest days:",
+        choices = c(
+          "All"                = "all",
+          "Short (≤ 6 days)"   = "short",
+          "Normal (7–10 days)" = "normal",
+          "Long (≥ 11 days)"   = "long"
+        ),
+        selected = "all"
+      ),
+      
+      selectInput(
+        "away_rest_cat",
+        "Away rest days:",
+        choices = c(
+          "All"                = "all",
+          "Short (≤ 6 days)"   = "short",
+          "Normal (7–10 days)" = "normal",
+          "Long (≥ 11 days)"   = "long"
+        ),
+        selected = "all"
+      ),
+      
+      hr(),
+      h4("Game conditions"),
+      
+      selectInput(
+        "grass_filter",
+        "Grass surface:",
+        choices  = c("All" = "all", "Grass only" = "yes", "Non-grass only" = "no"),
+        selected = "all"
+      ),
+      
+      selectInput(
+        "indoor_filter",
+        "Indoor / outdoor:",
+        choices  = c("All" = "all", "Indoor only" = "yes", "Outdoor only" = "no"),
+        selected = "all"
+      ),
+      
+      selectInput(
+        "weekend_filter",
+        "Weekend / Weekday:",
+        choices  = c("Both" = "both", "Weekend only" = "weekend", "Weekday only" = "weekday"),
+        selected = "both"
+      ),
+      
+      selectInput(
+        "time_of_day",
+        "Time of day (local):",
+        choices  = c("Both" = "both", "Noon (11–2)" = "noon", "Afternoon (2–7)" = "afternoon"),
+        selected = "both"
+      ),
+      
+      hr(),
+      h4("Teams & windows"),
+      
+      checkboxGroupInput(
+        "team_filter",
+        "Focus teams (uncheck to hide):",
+        choices  = all_teams,
+        selected = NULL
+      ),
+      tags$small("Leave all unselected to see all teams; choose any number of teams to see only those teams."),
+      
+      selectInput(
+        "team_side",
+        "Include teams as:",
+        choices  = c("Home and away" = "both", "Home only" = "home", "Away only" = "away"),
+        selected = "both"
+      ),
+      
+      sliderInput(
+        "min_games",
+        "Minimum games per 5-year window:",
+        min   = 5,
+        max   = 20,
+        value = 10,
+        step  = 1
+      ),
+      
+      br(),
+      tags$small(
+        "If filters are too strict, you may see a message about not having enough games. ",
+        "Relax filters (e.g., widen seasons or use 'All temperatures')."
+      )
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel(
+          "Rolling Predictability (plot)",
+          br(),
+          tags$p(
+            strong("What this shows: "),
+            "Mean absolute residual margin for each team in rolling 5-year windows. ",
+            "Lower values = more predictable performance.",
+            "The more noise there is in the graph, the less predictable the team becomes."
+          ),
+          plotOutput("stab_plot", height = "650px")
+        ),
+        tabPanel(
+          "Team Predictability (table)",
+          br(),
+          tags$p(
+            strong("What this shows: "),
+            "Overall predictability ranking by team, using a games-weighted average of mean absolute residuals across all windows.",
+            "Lower overall_volatility value = more predictability"
+          ),
+          DTOutput("stab_table")
+        ),
+        tabPanel(
+          "Trend slopes (plot)",
+          br(),
+          tags$p(
+            strong("What this shows: "),
+            "Slope of predictability over time by team. ",
+            "Negative slope = becoming more predictable; positive slope = less predictable"
+          ),
+          plotOutput("trend_plot", height = "650px")
+        ),
+        tabPanel(
+          "Trend results (table)",
+          br(),
+          tags$p(
+            strong("What this shows: "),
+            "Regression slopes and p-values for predictability trends by team."
+          ),
+          DTOutput("trend_table")
+        ),
+        tabPanel(
+          "Model summary",
+          br(),
+          tags$p(
+            "Mixed-effects regression of margin on environment variables, ",
+            "with random intercepts for home and away teams."
+          ),
+          verbatimTextOutput("model_summary")
+        )
+      )
+    )
+  )
+)
+
+# ---- SERVER ----
+server <- function(input, output, session) {
+  
+  # 1) Filter base data by user inputs ---------------------------------
+  filtered_nfl <- reactive({
+    df <- nfl_prepped
+    
+    # Season
+    df <- df %>%
+      filter(season >= input$season_range[1],
+             season <= input$season_range[2])
+    
+    # Temperature category
+    if (input$temp_cat == "cold") {
+      df <- df %>% filter(temp < 40)
+    } else if (input$temp_cat == "cool") {
+      df <- df %>% filter(temp >= 40, temp <= 59)
+    } else if (input$temp_cat == "warm") {
+      df <- df %>% filter(temp >= 60, temp <= 75)
+    } else if (input$temp_cat == "hot") {
+      df <- df %>% filter(temp > 75)
+    }
+    
+    # Wind category
+    if (input$wind_cat == "calm") {
+      df <- df %>% filter(wind <= 5)
+    } else if (input$wind_cat == "breezy") {
+      df <- df %>% filter(wind > 5, wind <= 15)
+    } else if (input$wind_cat == "windy") {
+      df <- df %>% filter(wind > 15)
+    }
+    
+    # Home rest category
+    if (input$home_rest_cat == "short") {
+      df <- df %>% filter(home_rest <= 6)
+    } else if (input$home_rest_cat == "normal") {
+      df <- df %>% filter(home_rest >= 7, home_rest <= 10)
+    } else if (input$home_rest_cat == "long") {
+      df <- df %>% filter(home_rest >= 11)
+    }
+    
+    # Away rest category
+    if (input$away_rest_cat == "short") {
+      df <- df %>% filter(away_rest <= 6)
+    } else if (input$away_rest_cat == "normal") {
+      df <- df %>% filter(away_rest >= 7, away_rest <= 10)
+    } else if (input$away_rest_cat == "long") {
+      df <- df %>% filter(away_rest >= 11)
+    }
+    
+    # Grass filter
+    if (input$grass_filter == "yes") {
+      df <- df %>% filter(grass == 1)
+    } else if (input$grass_filter == "no") {
+      df <- df %>% filter(grass == 0)
+    }
+    
+    # Indoor filter
+    if (input$indoor_filter == "yes") {
+      df <- df %>% filter(indoor == 1)
+    } else if (input$indoor_filter == "no") {
+      df <- df %>% filter(indoor == 0)
+    }
+    
+    # Weekend / weekday
+    if (input$weekend_filter == "weekend") {
+      df <- df %>% filter(weekend == 1)
+    } else if (input$weekend_filter == "weekday") {
+      df <- df %>% filter(weekend == 0)
+    }
+    
+    # Time of day
+    if (input$time_of_day == "noon") {
+      df <- df %>% filter(noon == 1)
+      
+    } else if (input$time_of_day == "afternoon") {
+      df <- df %>% filter(afternoon == 1)
+      
+    } else if (input$time_of_day == "both") {
+      # Do not filter; keep all noon + afternoon
+      df <- df
+    }
+    
+    validate(
+      need(nrow(df) > 0,
+           "Not enough historical games for these conditions — please relax your filters.")
+    )
+    
+    df
+  })
+  
+  # 2) Model + predictability pipeline (auto-updates on any filter change) --
+  results <- reactive({
+    nfl <- filtered_nfl()
+    
+    # Mixed-effects model
+    model_game <- lmer(
+      margin ~ temp + wind + grass + indoor +
+        weekend + noon + afternoon +
+        spread_line + home_rest + away_rest +
+        (1 | home_team) + (1 | away_team),
+      data = nfl
+    )
+    
+    nfl <- nfl %>%
+      mutate(
+        resid     = resid(model_game),
+        abs_resid = abs(resid)
+      )
+    
+    # Home / away or both
+    game_team <- nfl %>%
+      dplyr::select(season, abs_resid, home_team, away_team) %>%
+      pivot_longer(
+        cols      = c(home_team, away_team),
+        names_to  = "side",
+        values_to = "team"
+      ) %>%
+      mutate(team = factor(team))
+    
+    if (input$team_side == "home") {
+      game_team <- game_team %>% filter(side == "home_team")
+    } else if (input$team_side == "away") {
+      game_team <- game_team %>% filter(side == "away_team")
+    }
+    
+    # Team filter (after pivot_longer)
+    if (!is.null(input$team_filter) && length(input$team_filter) > 0) {
+      game_team <- game_team %>%
+        filter(as.character(team) %in% input$team_filter)
+    }
+    
+    validate(
+      need(nrow(game_team) > 0,
+           "Not enough games for the selected team(s) under these conditions — please relax filters or add more teams.")
+    )
+    
+    # 5-year windows
+    game_team <- game_team %>%
+      mutate(
+        window_start = season - 4,
+        window_end   = season,
+        window_mid   = season - 2,
+        window_label = paste0(window_start, "-", window_end)
+      ) %>%
+      filter(window_start >= 1999)
+    
+    team_window_stab <- game_team %>%
+      group_by(team, window_start, window_end, window_mid, window_label) %>%
+      summarise(
+        n_games        = n(),
+        mean_abs_resid = mean(abs_resid, na.rm = TRUE),
+        .groups        = "drop"
+      ) %>%
+      filter(n_games >= input$min_games)
+    
+    validate(
+      need(
+        nrow(team_window_stab) > 0,
+        "Not enough games per 5-year window for these settings — please relax your filters or lower the 'Minimum games per window'."
+      )
+    )
+    
+    # Team-level predictability
+    team_predictability <- team_window_stab %>%
+      group_by(team) %>%
+      summarise(
+        overall_volatility = weighted.mean(mean_abs_resid, w = n_games, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(overall_volatility)
+    
+    # Trend results
+    trend_results <- team_window_stab %>%
+      group_by(team) %>%
+      do(tidy(lm(mean_abs_resid ~ window_mid, data = .))) %>%
+      filter(term == "window_mid") %>%
+      arrange(estimate) %>%
+      mutate(
+        sig_level = case_when(
+          p.value < 0.01 ~ "Highly Significant (p < 0.01)",
+          p.value < 0.05 ~ "Significant (p < 0.05)",
+          p.value < 0.10 ~ "Marginally Significant (p < 0.10)",
+          TRUE           ~ "Not Significant (p ≥ 0.10)"
+        ),
+        sig_level = factor(
+          sig_level,
+          levels = c(
+            "Highly Significant (p < 0.01)",
+            "Significant (p < 0.05)",
+            "Marginally Significant (p < 0.10)",
+            "Not Significant (p ≥ 0.10)"
+          )
+        )
+      )
+    
+    list(
+      team_window_stab = team_window_stab,
+      team_predictability   = team_predictability,
+      trend_results    = trend_results,
+      model_game       = model_game
+    )
+  })
+  
+  # 3) Outputs ---------------------------------------------------------
+  
+  output$stab_plot <- renderPlot({
+    res <- results()
+    team_window_stab <- res$team_window_stab
+    
+    ggplot(team_window_stab,
+           aes(x = window_end,
+               y = mean_abs_resid,
+               group = team,
+               colour = team)) +
+      geom_line(size = 0.7, alpha = 0.9) +
+      facet_wrap(~ team, scales = "fixed") +
+      scale_x_continuous(
+        breaks = seq(2003, 2024, by = 5),
+        labels = function(v) {
+          sapply(v, function(z) {
+            paste(strsplit(as.character(z), "")[[1]], collapse = "\n")
+          })
+        }
+      ) +
+      scale_y_continuous(breaks = seq(4, 20, by = 4)) +
+      labs(
+        title = "5-Year Rolling Predictability Trend by Team",
+        x = "Window Ending Year",
+        y = "Mean Absolute Residual (Lower = More Predictable)"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        plot.margin = margin(t = 5, r = 5, b = 5, l = 20),
+        axis.text.y = element_text(size = 6),
+        axis.text.x = element_text(size = 6, lineheight = 0.7)
+      )
+  })
+  
+  output$stab_table <- renderDT({
+    res <- results()
+    df  <- res$team_predictability
+    
+    datatable(
+      df,
+      options = list(pageLength = 32),
+      rownames = FALSE
+    )
+  })
+  
+  output$trend_plot <- renderPlot({
+    res <- results()
+    trend_results <- res$trend_results
+    
+    sig_colors <- c(
+      "Highly Significant (p < 0.01)"     = "#00FFCC",
+      "Significant (p < 0.05)"            = "#ffc855",
+      "Marginally Significant (p < 0.10)" = "#fec00b",
+      "Not Significant (p ≥ 0.10)"        = "gray70"
+    )
+    
+    ggplot(trend_results,
+           aes(x = estimate,
+               y = reorder(team, estimate),
+               color = sig_level)) +
+      geom_point(size = 3) +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      scale_color_manual(values = sig_colors) +
+      labs(
+        title = "Long-Term Predictability Trend by Team (1999–2024)",
+        x = "Slope of Mean Absolute Residual\n(Negative = Becoming More Predictable, Positive = Less Predictable)",
+        y = "Team",
+        color = "Significance Level"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = "right",
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 12)
+      )
+  })
+  
+  output$trend_table <- renderDT({
+    res <- results()
+    df  <- res$trend_results
+    
+    datatable(
+      df,
+      options = list(pageLength = 32),
+      rownames = FALSE
+    )
+  })
+  
+  output$model_summary <- renderPrint({
+    res <- results()
+    summary(res$model_game)
+  })
+}
+
+# ---- Run the app ----
+shinyApp(ui = ui, server = server)
