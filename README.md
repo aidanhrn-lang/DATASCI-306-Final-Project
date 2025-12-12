@@ -6,7 +6,7 @@ This project is a webapp built using Shiny in order to measure and analyze the p
 
 ### Five windows allow for the exploration of the effect that these variables have on a teams predictability.
 
-Rolling Predictabiltity (plot): This is a visual representation of how the predictability of NFL teams changes over time. Each line graph represents a different NFL team. Lower scores show that a team was more predictable during that time.
+Rolling Predictability (plot): This is a visual representation of how the predictability of NFL teams changes over time. Each line graph represents a different NFL team. Lower scores show that a team was more predictable during that time.
 
 Team Predictability (table): This is a table of the overall predictability of an NFL team. Again, lower scores represent a team that is more predictable.
 
